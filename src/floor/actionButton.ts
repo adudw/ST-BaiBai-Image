@@ -1,9 +1,12 @@
-import { requestFloorTags } from '@/autoTag/runner';
+import { prepareTargetText } from '@/autoTag/clean';
+import { requestFloorTags, requestSelectedFloorTags } from '@/autoTag/runner';
 import { confirmDialog } from '@/components/confirm';
+import { stripImageTags } from '@/st/imageTagRegex';
 import { ensureChatObserver, onChatMutation } from '@/floor/chatObserver';
 import { isCurrentChatExcluded, settings } from '@/state/settings';
 import { getContext, isAiStoryMessage } from '@/st/context';
 import { hasImageTagTrace } from '@/st/imageTagRegex';
+import { selectStorySegments } from '@/floor/selectSegments';
 
 /**
  * 楼层「生成生图 tag」按钮注入。
@@ -26,14 +29,16 @@ import { hasImageTagTrace } from '@/st/imageTagRegex';
  */
 
 const BUTTON_CLASS = 'bbi-tag-action';
+const SELECT_BUTTON_CLASS = 'bbi-tag-select-action';
 // 与扩展菜单入口同款调色板图标
 const ICON_CLASS = 'fa-palette';
 
 let bound = false;
 
 function setRunning(button: HTMLElement, running: boolean): void {
+  const iconClass = button.dataset.iconClass || ICON_CLASS;
   button.dataset.running = running ? '1' : '';
-  button.classList.toggle(ICON_CLASS, !running);
+  button.classList.toggle(iconClass, !running);
   button.classList.toggle('fa-spinner', running);
   button.classList.toggle('fa-spin', running);
 }
@@ -73,15 +78,46 @@ async function onActivate(button: HTMLElement): Promise<void> {
   }
 }
 
-function createButton(): HTMLDivElement {
+async function onSelectActivate(button: HTMLElement): Promise<void> {
+  if (button.dataset.running === '1') return;
+  const floor = Number(button.closest('.mes')?.getAttribute('mesid'));
+  const context = getContext();
+  const message = Number.isInteger(floor) ? context?.chat?.[floor] : undefined;
+  if (!context || !message) {
+    toastr.warning('找不到这一楼的消息，请刷新页面后重试', '柏宝绘');
+    return;
+  }
+  if (!settings.enabled) {
+    toastr.warning('柏宝绘已停用，请先在插件设置里开启', '柏宝绘');
+    return;
+  }
+  const prepared = prepareTargetText(stripImageTags(message.mes ?? ''), settings.excludes.customStripTags);
+  if (!prepared.segments.length) {
+    toastr.info('本楼没有可选择的剧情段落', '柏宝绘');
+    return;
+  }
+  const lines = await selectStorySegments(prepared.segments);
+  if (!lines?.length) return;
+  setRunning(button, true);
+  try {
+    await requestSelectedFloorTags(floor, lines);
+  } finally {
+    setRunning(button, false);
+  }
+}
+
+function createButton(selectedOnly = false): HTMLDivElement {
+  const actionClass = selectedOnly ? SELECT_BUTTON_CLASS : BUTTON_CLASS;
+  const iconClass = selectedOnly ? 'fa-list-check' : ICON_CLASS;
   const button = document.createElement('div');
   // mes_button 与 .extraMesButtons 里的 ST 原生扩展按钮同类(menu_button 是通用菜单按钮,样式不同)
-  button.className = `mes_button fa-solid ${ICON_CLASS} ${BUTTON_CLASS}`;
-  button.title = '生成生图 tag（已有 tag 时重新生成）';
+  button.className = `mes_button fa-solid ${iconClass} ${actionClass}`;
+  button.dataset.iconClass = iconClass;
+  button.title = selectedOnly ? '选择剧情段落生成 tag' : '生成生图 tag（已有 tag 时重新生成）';
   button.setAttribute('role', 'button');
   button.setAttribute('tabindex', '0');
 
-  const activate = () => void onActivate(button);
+  const activate = () => void (selectedOnly ? onSelectActivate(button) : onActivate(button));
   button.addEventListener('click', activate);
   button.addEventListener('keydown', event => {
     if (event.key === 'Enter' || event.key === ' ') {
@@ -113,8 +149,11 @@ function syncButtons(): void {
     // 顺带的好处:/hide 只翻属性、不动 DOM 树,本来就触发不了 observer,现在也无需触发。
     const wanted = !excluded && Number.isInteger(floor) && isAiStoryMessage(chat[floor]);
     const existing = extra.querySelector<HTMLElement>(`.${BUTTON_CLASS}`);
+    const selected = extra.querySelector<HTMLElement>(`.${SELECT_BUTTON_CLASS}`);
     if (wanted && !existing) extra.appendChild(createButton());
-    else if (!wanted && existing && existing.dataset.running !== '1') existing.remove();
+    if (wanted && !selected) extra.appendChild(createButton(true));
+    if (!wanted && existing && existing.dataset.running !== '1') existing.remove();
+    if (!wanted && selected && selected.dataset.running !== '1') selected.remove();
   }
 }
 

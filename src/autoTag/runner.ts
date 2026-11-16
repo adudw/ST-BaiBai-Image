@@ -6,11 +6,12 @@ import {
   resolveCharAnchors,
   type PositionedCharOp,
 } from '@/autoTag/charAnchors';
-import { prepareTargetText } from '@/autoTag/clean';
+import { prepareTargetText, type PreparedTargetText } from '@/autoTag/clean';
 import { beginGeneration, clearGeneration, consumeGeneration } from '@/autoTag/generationGate';
 import { autoTagProfile, buildAutoTagMessages } from '@/autoTag/prompt';
 import { rebaseImagePositions, type RebaseReport } from '@/autoTag/rebase';
 import { buildSlotTaskNote } from '@/autoTag/slotPlan';
+import { replaceSelectedImageTags, selectedImageSequences } from '@/autoTag/selective';
 import {
   BBI_CHAR_EXTRA_KEY,
   CHAR_TAG_FIELDS,
@@ -116,6 +117,8 @@ interface RunOptions {
    * 且忽略本次 AI 的 changes(首次全量分析已为整楼建过档)。
    */
   slot?: { seq: number };
+  /** 手动选择的目标正文物理行(基于剔除所有旧 tag 后的正文)。 */
+  selectedLines?: number[];
 }
 
 /** 放弃写入的用户可读原因。文本变化已不在其中——那是正常情况,会 rebase 后照常写入。 */
@@ -201,6 +204,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     manual: Boolean(opts.manual),
     replace: Boolean(opts.replace),
     slotSeq: opts.slot?.seq ?? null,
+    selectedLineCount: opts.selectedLines?.length ?? 0,
     chatId: context?.getCurrentChatId?.() ?? '',
     extensionEnabled: settings.enabled,
     autoTagEnabled: settings.autoTag.enabled,
@@ -240,6 +244,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     return;
   }
   const rawSource = message.mes;
+  const selective = Array.isArray(opts.selectedLines) && opts.selectedLines.length > 0;
   const slot = opts.slot;
   // 单槽重写的目标:开跑时快照第 seq 条 tag 的原文,写回前用它确认 seq 指的还是同一条
   // (同提示词编辑弹窗的纪律)。正文这会儿已经没这条 tag = 期间被删/换 swipe,直接放弃。
@@ -266,7 +271,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   // 探测口径与按钮层同源(imageTagRegex.hasImageTagTrace):两侧漂移过一次——
   // 按钮只认开标签、这里认开也认闭,只剩 `</bbi_image>` 的楼就卡成「点了没反应」。
   // 单槽重写以「本楼已有 tag」为前提,不受此闸门拦截。
-  if (hasImageTagTrace(rawSource) && !opts.replace && !slot) {
+  if (hasImageTagTrace(rawSource) && !opts.replace && !slot && !selective) {
     abort(
       floor,
       'already-has-image-tag',
@@ -278,12 +283,24 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   }
   // replace / slot:分析都基于剔除旧 tag 后的正文。写回时 replace 让旧 tag 随之消失,
   // slot 按 seq 原位替换——别的 tag 在写回基底里原样保留。
-  const source = opts.replace || slot ? stripImageTags(rawSource) : rawSource;
+  const source = opts.replace || slot || selective ? stripImageTags(rawSource) : rawSource;
   if (!source.trim()) {
     abort(floor, 'empty-source', opts.manual, '本楼正文是空的（或只剩生图 tag），没有可分析的内容');
     return;
   }
-  const preparedTarget = prepareTargetText(source, settings.excludes.customStripTags);
+  const allPreparedTarget = prepareTargetText(source, settings.excludes.customStripTags);
+  const selectedSet = selective ? new Set(opts.selectedLines) : null;
+  const selectedSegments = selectedSet
+    ? allPreparedTarget.segments.filter(segment => selectedSet.has(segment.sourceLine))
+    : allPreparedTarget.segments;
+  const preparedTarget: PreparedTargetText = selectedSet
+    ? {
+        segments: selectedSegments.map((segment, index) => ({ ...segment, id: `P${index + 1}` })),
+        promptText: selectedSegments
+          .map((segment, index) => `${segment.text} ⟦P${index + 1}⟧`)
+          .join('\n\n'),
+      }
+    : allPreparedTarget;
   if (!preparedTarget.segments.length) {
     abort(
       floor,
@@ -322,12 +339,17 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   running.get(runKey)?.abort();
   const controller = new AbortController();
   running.set(runKey, controller);
+  let markedSequenceIndexes: number[] = [];
 
   try {
-    const memory = readBookMemory(floor, context.chat[floor]?.mes ?? '', context.name1);
+    const memory = readBookMemory(
+      floor,
+      selective ? selectedSegments.map(segment => segment.text).join('\n') : context.chat[floor]?.mes ?? '',
+      context.name1,
+    );
     // 单槽重写:库文本要包含本楼已落档的增量(首次全量分析建的档),否则 AI 会把
     // 已建档角色当新人重写。charTagsBeforeFloor(floor + 1) 正好含本楼(swipe 匹配时生效)。
-    const entriesBefore = slot ? charTagsBeforeFloor(floor + 1) : charTagsBeforeFloor(floor);
+    const entriesBefore = slot || selective ? charTagsBeforeFloor(floor + 1) : charTagsBeforeFloor(floor);
     // 锁定名(全局库 ⊖ 本聊天基线):AI 的 changes 对这些名字一律无效,库文本里带 [locked] 标记
     const lockedNames = lockedCharTagNames();
     // 纯本地渲染:建档由主请求在同一次输出里完成(changes 的 field="new")
@@ -349,6 +371,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       anchors.text,
       slot ? buildSlotTaskNote(rawSource, slot.seq) : '',
       profile,
+      selectedSet ? selectedSegments.map(segment => segment.text).join('\n') : undefined,
     );
     const channel = getTagGenChannel();
     // 失败重试:请求异常与「返回无法解析/校验不通过」都视为可重试的异常(后者常见于模型没遵守协议);
@@ -434,7 +457,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
 
     // 单槽重写不落 changes:首次全量分析已为整楼建过档,这里再应用一次只会产生
     // 重复的建档/变更记录;库文本已含本楼增量(见上面 entriesBefore),AI 照抄即可。
-    const planOps = slot ? [] : planChangeOps(plan);
+    const planOps = slot || selective ? [] : planChangeOps(plan);
     // 锁定角色(全局库)不接受 AI changes:丢弃,不写入楼层、不参与 @替换。
     // 重放侧 applyCharTagOps 也会按锁定名再拦一次(旧消息里可能已存这类 ops)。
     const effectiveOps = lockedNames.size
@@ -523,7 +546,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       return;
     }
     // 没有图片、没有角色变化、也没有旧楼层变化要清理时,保持原来的无写入早退。
-    if (!plan.images.length && !floorOps.length && !previousDelta) {
+    if (!plan.images.length && !floorOps.length && !previousDelta && !selective) {
       if (opts.manual) toastr.info('模型认为本楼没有值得插图的画面', '柏宝绘');
       else console.debug(`[柏宝绘] 第 ${floor} 楼无需插图`);
       return;
@@ -538,7 +561,11 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     if (marked) {
       if (slot) {
         markForAutoGenerate(chatId, floor, markSwipeId, slot.seq, 'force');
+      } else if (selective) {
+        markedSequenceIndexes = selectedImageSequences(rawSource, selectedSet!, plan.images);
+        for (const seq of markedSequenceIndexes) markForAutoGenerate(chatId, floor, markSwipeId, seq);
       } else {
+        markedSequenceIndexes = plan.images.map((_, seq) => seq);
         for (let seq = 0; seq < plan.images.length; seq++) {
           markForAutoGenerate(chatId, floor, markSwipeId, seq);
         }
@@ -558,10 +585,10 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
           return replaceImageTagAt(currentText, slot.seq, serializeImageTag(plan.images[0]));
         }
         // replace 路径同样以当前正文为基底剔除旧 tag,不能用旧快照
-        const base = opts.replace ? stripImageTags(currentText) : currentText;
-        if (!plan.images.length) return base;
+        const base = opts.replace || selective ? stripImageTags(currentText) : currentText;
+        if (!plan.images.length && !selective) return base;
         // 请求期间用户/别的插件已经贴过 tag:再注入就是重复,交回 build-failed 走放弃分支
-        if (!opts.replace && hasImageTagTrace(currentText)) return null;
+        if (!opts.replace && !selective && hasImageTagTrace(currentText)) return null;
         const rebased = rebaseImagePositions(
           base,
           preparedTarget.segments,
@@ -570,13 +597,34 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
         );
         if (!rebased) return null;
         rebaseNote = describeRebase(rebased.report);
+        if (selective) {
+          // 与新 tag 使用同一套正文对齐,确保请求期间有其它插件改写/追加段落时,
+          // 旧 tag 的清理范围也跟着所选段落移动,不会误删相邻段落的 tag。
+          const selectedAnchors = rebaseImagePositions(
+            base,
+            allPreparedTarget.segments,
+            selectedSegments.map(segment => ({
+              position: segment.id,
+              sourceLine: segment.sourceLine,
+              tag: '',
+              nl: '',
+              negative: '',
+              characters: [],
+              size: 'portrait' as const,
+            })),
+            settings.excludes.customStripTags,
+          );
+          if (!selectedAnchors) return null;
+          const currentSelectedLines = new Set(selectedAnchors.images.map(image => image.sourceLine));
+          return replaceSelectedImageTags(currentText, currentSelectedLines, rebased.images);
+        }
         return injectImageTags(base, rebased.images);
       },
       chatId,
       swipeId,
       message,
       // 单槽不写法:本楼角色增量与其它槽位图片都不归它管,不传 extraUpdate 即保持原样。
-      slot
+      slot || selective
         ? undefined
         : {
             key: BBI_CHAR_EXTRA_KEY,
@@ -607,7 +655,9 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     // 撤销标记只撤自己那一枚:clearAutoGenerateForFloor 会连累同楼其它槽位的待消费标记。
     if (marked) {
       if (slot) consumeAutoGenerate(chatId, floor, markSwipeId, slot.seq);
-      else clearAutoGenerateForFloor(chatId, floor);
+      else if (selective) {
+        for (const seq of markedSequenceIndexes) consumeAutoGenerate(chatId, floor, markSwipeId, seq);
+      } else clearAutoGenerateForFloor(chatId, floor);
     }
     console.info(`[柏宝绘] 第 ${floor} 楼放弃写入生图 tag：${result}`);
     // 单槽重写的放弃原因与全量不同:正文其它部分改没改不重要,关键是这一条 tag 被改过
@@ -622,7 +672,9 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     // 异常发生在挂标记之后时(如保存失败回滚),撤销本楼标记,不留残留。
     // 单槽只撤自己那一枚:clearAutoGenerateForFloor 会连累同楼其它槽位的待消费标记。
     if (slot) consumeAutoGenerate(chatId, floor, swipeId ?? 0, slot.seq);
-    else clearAutoGenerateForFloor(chatId, floor);
+    else if (selective) {
+      for (const seq of markedSequenceIndexes) consumeAutoGenerate(chatId, floor, swipeId ?? 0, seq);
+    } else clearAutoGenerateForFloor(chatId, floor);
     if (controller.signal.aborted) return;
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[柏宝绘] 第 ${floor} 楼自动生成 tag 失败`, error);
@@ -659,6 +711,11 @@ function scheduleForGeneratedFloor(floor: number, chatId: string): void {
  */
 export async function requestFloorTags(floor: number, opts: { replace?: boolean } = {}): Promise<void> {
   await runForFloor(floor, { manual: true, replace: opts.replace });
+}
+
+/** 只基于用户勾选的段落重新生成,并保留其它段落上已有的 tag。 */
+export async function requestSelectedFloorTags(floor: number, lines: number[]): Promise<void> {
+  await runForFloor(floor, { manual: true, selectedLines: [...new Set(lines)] });
 }
 
 /**

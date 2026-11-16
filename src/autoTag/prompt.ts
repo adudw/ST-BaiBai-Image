@@ -174,6 +174,8 @@ export async function buildAutoTagMessages(
   taskNote?: string,
   /** 协议形态;runner 开跑时快照一份传进来,验收与收尾用同一份(缺省即时现算)。 */
   profile: AutoTagProfile = autoTagProfile(),
+  /** 选段生成时,世界书关键词也只扫描选中的目标段落。 */
+  selectedFloorText?: string,
 ): Promise<ChatMsg[]> {
   const target = context.chat[targetFloor];
   const preparedTarget =
@@ -194,8 +196,13 @@ export async function buildAutoTagMessages(
   // 世界书/角色卡/人设:与柏宝书摘要副 API 同口径(有则带,取不到降级为空,不影响主流程)。
   // 世界书扫描文本 = 目标楼 + 携带的上下文楼(关键词激活与主对话一致)。
   const scanFloors = recentFloors(context, targetFloor, options.contextMessages);
+  const scanChat = selectedFloorText === undefined
+    ? context.chat
+    : context.chat.map((message, floor) =>
+        floor === targetFloor ? { ...message, mes: selectedFloorText } : message,
+      );
   const [worldInfo, charCard, persona] = await Promise.all([
-    fetchWorldInfo(context.chat, scanFloors, context.name1, context.name2),
+    fetchWorldInfo(scanChat, scanFloors, context.name1, context.name2),
     Promise.resolve(fetchCharCard(context)),
     Promise.resolve(fetchUserPersona(context)),
   ]);
