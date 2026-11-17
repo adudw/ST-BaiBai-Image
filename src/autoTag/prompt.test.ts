@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { autoTagProfile, buildAutoTagMessages, expandNlSections } from '@/autoTag/prompt';
+import { prepareTargetText } from '@/autoTag/clean';
+import { buildSelectedTaskNote } from '@/autoTag/selective';
 import {
   activeComfyPreset,
   activeNaiPlan,
@@ -90,6 +92,25 @@ function context(): STContext {
 }
 
 describe('auto tag prompt', () => {
+  it.each([false, true])('selected paragraphs require exactly one image each (comic=%s), ignoring global counts', async comic => {
+    const target = prepareTargetText('选中的第一段\n选中的第二段', []);
+    const options = { ...settings.autoTag, minImages: 0, maxImages: 1 };
+    const profile = { ...autoTagProfile(), comic };
+    const messages = await buildAutoTagMessages(
+      context(), 1, options, null, target, null,
+      buildSelectedTaskNote(target), profile, '选中的第一段\n选中的第二段',
+    );
+    const contract = messages.find(message => message.role === 'system' && message.content.startsWith(comic ? '你是严谨的漫画分镜师' : '你是严谨的剧情画面规划'))!.content;
+    expect(contract).toContain(comic ? '每段恰好生成一页漫画' : '每段各生成且只生成一张图片');
+    expect(contract).toContain('P1、P2');
+    expect(contract).not.toContain('images 数量必须在 0～1 之间');
+    expect(contract).not.toContain('几页可以共用同一个 position');
+    expect(contract).not.toContain('不要返回同一事件的相邻动作');
+    expect(messages.at(-1)!.content).toContain('每段必须且只能生成一张图片');
+    expect(messages.at(-1)!.content).not.toContain('目标第一行');
+    expect(options).toMatchObject({ minImages: 0, maxImages: 1 });
+  });
+
   it('marks only clean target paragraphs without pulling user messages before the earliest selected AI floor', async () => {
     const options: AutoTagSettings = {
       enabled: true,

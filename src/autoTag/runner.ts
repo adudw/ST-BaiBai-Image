@@ -11,7 +11,12 @@ import { beginGeneration, clearGeneration, consumeGeneration } from '@/autoTag/g
 import { autoTagProfile, buildAutoTagMessages } from '@/autoTag/prompt';
 import { rebaseImagePositions, type RebaseReport } from '@/autoTag/rebase';
 import { buildSlotTaskNote } from '@/autoTag/slotPlan';
-import { replaceSelectedImageTags, selectedImageSequences } from '@/autoTag/selective';
+import {
+  buildSelectedTaskNote,
+  parseSelectedImagePlan,
+  replaceSelectedImageTags,
+  selectedImageSequences,
+} from '@/autoTag/selective';
 import {
   BBI_CHAR_EXTRA_KEY,
   CHAR_TAG_FIELDS,
@@ -359,7 +364,9 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     // parse 校验,只改一处会自相矛盾。
     const promptOptions = slot
       ? { ...settings.autoTag, minImages: 1, maxImages: 1 }
-      : settings.autoTag;
+      : selective
+        ? { ...settings.autoTag, minImages: selectedSegments.length, maxImages: selectedSegments.length }
+        : settings.autoTag;
     // 协议形态开跑时快照一次:写协议、验收与收尾同一份,用户中途拨开关也不会前后不一
     const profile = autoTagProfile();
     const messages = await buildAutoTagMessages(
@@ -369,7 +376,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       memory,
       preparedTarget,
       anchors.text,
-      slot ? buildSlotTaskNote(rawSource, slot.seq) : '',
+      slot ? buildSlotTaskNote(rawSource, slot.seq) : selective ? buildSelectedTaskNote(preparedTarget) : '',
       profile,
       selectedSet ? selectedSegments.map(segment => segment.text).join('\n') : undefined,
     );
@@ -391,19 +398,22 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
         // (直接 let 会被 TS 收窄成 null:闭包内的赋值控制流分析看不见。)
         const parsed: { plan: ImagePlan | null } = { plan: null };
         const validate = (raw: string) => {
-          // 漫画不受张数上下限约束(页数由 AI 按内容定),只要求至少一页
-          const candidate = profile.comic
-            ? parseComicPlan(raw, preparedTarget.segments)
-            : parseImagePlan(
-                raw,
-                preparedTarget.segments,
-                promptOptions.minImages,
-                promptOptions.maxImages,
-              );
+          // 选段强制逐段对应;普通漫画流程仍由 AI 决定页数。
+          const candidate = selective
+            ? parseSelectedImagePlan(raw, preparedTarget.segments, profile.comic)
+            : profile.comic
+              ? parseComicPlan(raw, preparedTarget.segments)
+              : parseImagePlan(
+                  raw,
+                  preparedTarget.segments,
+                  promptOptions.minImages,
+                  promptOptions.maxImages,
+                );
           // 单槽重写忽略本次 changes,不校验建档 nl —— 校验它会为一份会被丢弃的
           // changes 白白消耗重试次数。NAI 关了自然语言时协议不要 nl,也就不验。
           if (
             !slot &&
+            !selective &&
             profile.naiCharPrompts &&
             profile.nl &&
             candidate.changes.some(change => change.field === 'new' && !change.nl?.trim())
@@ -415,7 +425,9 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
         // 有重试时给 source 带上第几次,历史里两条记录一眼看出是重试关系
         const source = slot
           ? `重写提示词(第 ${floor} 楼 · 第 ${slot.seq + 1} 张${retries > 0 ? ` · 第 ${attempt + 1} 次` : ''})`
-          : retries > 0
+          : selective
+            ? `选段生成 tag(第 ${floor} 楼 · ${selectedSegments.length} 段${retries > 0 ? ` · 第 ${attempt + 1} 次` : ''})`
+            : retries > 0
             ? `自动 tag(第 ${floor} 楼 · 第 ${attempt + 1} 次)`
             : `自动 tag(第 ${floor} 楼)`;
         if (channel) {
@@ -554,17 +566,13 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
 
     // 触发 MESSAGE_EDITED / MESSAGE_UPDATED,卡片水合挂载时消费标记并自动开始生成
     // (见 floor/autoGenerate.ts);写回失败则撤销标记。
-    // 单槽重写是用户在卡片上的显式意图(同提示词编辑弹窗的「应用并重新生成」),
-    // 不受 autoTag.autoGenerate 开关约束,一律 force 出图。
+    // 单槽重写和选段生成都是显式出图请求,不受自动出图开关约束,使用 force。
     const markSwipeId = message.swipe_id ?? 0;
-    const marked = plan.images.length > 0 && (settings.autoTag.autoGenerate || !!slot);
+    const marked = plan.images.length > 0 && (settings.autoTag.autoGenerate || !!slot || selective);
     if (marked) {
       if (slot) {
         markForAutoGenerate(chatId, floor, markSwipeId, slot.seq, 'force');
-      } else if (selective) {
-        markedSequenceIndexes = selectedImageSequences(rawSource, selectedSet!, plan.images);
-        for (const seq of markedSequenceIndexes) markForAutoGenerate(chatId, floor, markSwipeId, seq);
-      } else {
+      } else if (!selective) {
         markedSequenceIndexes = plan.images.map((_, seq) => seq);
         for (let seq = 0; seq < plan.images.length; seq++) {
           markForAutoGenerate(chatId, floor, markSwipeId, seq);
@@ -591,31 +599,23 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
         if (!opts.replace && !selective && hasImageTagTrace(currentText)) return null;
         const rebased = rebaseImagePositions(
           base,
-          preparedTarget.segments,
+          selective ? allPreparedTarget.segments : preparedTarget.segments,
           plan.images,
           settings.excludes.customStripTags,
         );
         if (!rebased) return null;
         rebaseNote = describeRebase(rebased.report);
         if (selective) {
-          // 与新 tag 使用同一套正文对齐,确保请求期间有其它插件改写/追加段落时,
-          // 旧 tag 的清理范围也跟着所选段落移动,不会误删相邻段落的 tag。
-          const selectedAnchors = rebaseImagePositions(
-            base,
-            allPreparedTarget.segments,
-            selectedSegments.map(segment => ({
-              position: segment.id,
-              sourceLine: segment.sourceLine,
-              tag: '',
-              nl: '',
-              negative: '',
-              characters: [],
-              size: 'portrait' as const,
-            })),
-            settings.excludes.customStripTags,
-          );
-          if (!selectedAnchors) return null;
-          const currentSelectedLines = new Set(selectedAnchors.images.map(image => image.sourceLine));
+          // Every paragraph now has exactly one image, so cleanup follows those same anchors.
+          // If a paragraph disappeared or multiple paragraphs merged, preserve the old tags.
+          const currentSelectedLines = new Set(rebased.images.map(image => image.sourceLine));
+          if (rebased.report.drifted || currentSelectedLines.size !== selectedSegments.length) return null;
+          // Mark only the final indexes, after rebasing and accounting for retained tags.
+          // Explicit paragraph generation must draw even if automatic drawing is disabled.
+          markedSequenceIndexes = selectedImageSequences(currentText, currentSelectedLines, rebased.images);
+          for (const seq of markedSequenceIndexes) {
+            markForAutoGenerate(chatId, floor, markSwipeId, seq, 'force');
+          }
           return replaceSelectedImageTags(currentText, currentSelectedLines, rebased.images);
         }
         return injectImageTags(base, rebased.images);

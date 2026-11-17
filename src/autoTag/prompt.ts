@@ -275,8 +275,11 @@ export async function buildAutoTagMessages(
   // 生成自相矛盾的数量协议。上限至少 1,下限 0 表示保留「本楼无需插图」的质量优先口径。
   const maxImages = Math.max(1, Math.floor(Number(options.maxImages)) || 1);
   const minImages = Math.min(maxImages, Math.max(0, Math.floor(Number(options.minImages)) || 0));
+  const selectedParagraphs = selectedFloorText !== undefined;
   const imageCountRule =
-    minImages === 0
+    selectedParagraphs
+      ? `2. 用户手动选择了 ${preparedTarget.segments.length} 个段落，必须为每段各生成且只生成一张图片，images 恰好 ${preparedTarget.segments.length} 项。position 逐一覆盖 ${preparedTarget.segments.map(segment => segment.id).join('、')}，每个编号只能出现一次，不得返回空数组、跳段、合并或额外生成。每张图只表现对应段落的一个瞬间；即使相邻段落相似也不得省略。此规则优先于自动选图、去重和张数范围规则。`
+      : minImages === 0
       ? `2. images 数量必须在 0～${maxImages} 之间。没有值得绘制的可见瞬间时可以返回空数组；不要为了接近上限而凑数。`
       : `2. images 数量必须在 ${minImages}～${maxImages} 之间。下限 ${minImages} 是用户明确要求：即使最强候选不足，也必须从目标正文中较次但仍可见的单一瞬间补足，不得返回少于 ${minImages} 张或空数组。达到下限后不要为了接近上限而凑数。`;
 
@@ -333,7 +336,7 @@ ${outputShape}
 
 规则：
 1. 先完成角色建档与变化检查，再选图；不能因为没有图片或图片数量较少而跳过 changes 检查，没有任何变化时 changes 返回空数组。
-${imageCountRule} 多张图必须是剧情或视觉状态明显不同的单一瞬间，不要返回同一事件的相邻动作或换镜头版本。
+${imageCountRule}${selectedParagraphs ? '' : ' 多张图必须是剧情或视觉状态明显不同的单一瞬间，不要返回同一事件的相邻动作或换镜头版本。'}
 3. position 必须是“目标正文”段尾标出的 P编号（如 P2），表示把图片 tag 插在该段之后；选择让画面所需事实刚刚完整成立、且尚未切换到下一场景的位置。不要返回此前上下文中的位置，也不要自行编造编号。
 ${contentRule}${negativeRule}
 ${sizeRule}
@@ -375,8 +378,8 @@ ${comicShape}
 
 规则：
 1. 先完成角色建档与变化检查，再分页；没有任何变化时 changes 返回空数组。
-2. 把目标正文改编成漫画，至少一页。漫画是精选改编，不是逐段图解：只画推动剧情的事件、情绪转折和最有画面感的瞬间；一句带过的过渡、来回重复的对话、纯心理和说明性文字直接略去，不必每段都有对应的格。每页 3～5 格，把选出的瞬间排进尽量少的页里：一楼正文通常 1～2 页就够，只有场景多次切换、剧情跨度很大时才多画几页，不要按段落或场景机械地一段一页。也不要把同一个瞬间拆成好几格凑数。pages 按剧情先后排列。
-3. position 必须是“目标正文”段尾标出的 P编号（如 P3），表示把这一页插在该段之后；填这一页所画剧情的最后一段。几页可以共用同一个 position。不要返回此前上下文中的位置，也不要自行编造编号。
+${selectedParagraphs ? `2. 用户手动选择了 ${preparedTarget.segments.length} 个段落，每段恰好生成一页漫画，pages 恰好 ${preparedTarget.segments.length} 项，不得遗漏、合并段落或增加页数；每页只改编对应段落。此规则优先于自动精选、合并场景和页数规则。` : '2. 把目标正文改编成漫画，至少一页。漫画是精选改编，不是逐段图解：只画推动剧情的事件、情绪转折和最有画面感的瞬间；一句带过的过渡、来回重复的对话、纯心理和说明性文字直接略去，不必每段都有对应的格。每页 3～5 格，把选出的瞬间排进尽量少的页里：一楼正文通常 1～2 页就够，只有场景多次切换、剧情跨度很大时才多画几页，不要按段落或场景机械地一段一页。也不要把同一个瞬间拆成好几格凑数。pages 按剧情先后排列。'}
+3. position 必须是“目标正文”段尾标出的 P编号（如 P3），表示把这一页插在该段之后；${selectedParagraphs ? `必须逐一覆盖 ${preparedTarget.segments.map(segment => segment.id).join('、')}，每个编号恰好一次，按段落顺序排列。` : '填这一页所画剧情的最后一段。几页可以共用同一个 position。'}不要返回此前上下文中的位置，也不要自行编造编号。
 4. 每页必须有 summary（整页共用的描述，字符串）和 items 数组。items 每项必须有 label、caption、bbox：label 只能是 character / object / text；text 项还必须有 text（画面里要出现的字）。bbox 是 [y0, x0, y1, x1]，取 0～1000 的整数，原点在页面左上角，y 向下、x 向右。不要写 tag、nl、negative、characters 键；任何文本里不得出现 <bbi_image>/<layout>/<type> 等标签。
 ${comicSizeRule}
 6. 只画目标正文，不给此前上下文补画；不得把不在场的人画进去，不为凑热闹加入路人。

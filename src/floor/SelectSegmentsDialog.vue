@@ -42,12 +42,12 @@ requestAnimationFrame(() => { open.value = true; });
         <button class="bbi-icon-mini" type="button" aria-label="关闭" @click="emit('cancel')">×</button>
       </header>
       <p class="bbi-select-segments__hint">
-        只分析勾选的段落。未选段落及其已有 tag 会保留；选中段落已有的 tag 会由新结果替换。
+        每个勾选段落固定生成一张图片，不使用设置里的最少／最多张数。未选段落及其 tag 保留；成功后替换所选段落的旧 tag。
       </p>
       <div class="bbi-select-segments__tools">
         <button class="bbi-btn" type="button" @click="setAll(true)">全选</button>
         <button class="bbi-btn" type="button" @click="setAll(false)">清空</button>
-        <span>已选 {{ count }} / {{ segments.length }} 段</span>
+        <span>已选 {{ count }} / {{ segments.length }} 段 · 生成 {{ count }} 张</span>
       </div>
       <div class="bbi-select-segments__list">
         <label v-for="(segment, index) in segments" :key="segment.sourceLine" class="bbi-select-segments__item">
@@ -64,7 +64,7 @@ requestAnimationFrame(() => { open.value = true; });
         <span class="bbi-modal-foot-spacer"></span>
         <button class="bbi-btn" type="button" @click="emit('cancel')">取消</button>
         <button class="bbi-btn bbi-btn-primary" type="button" :disabled="!count" @click="confirm">
-          按所选段落生成 tag
+          生成 {{ count }} 张图片
         </button>
       </footer>
     </section>
