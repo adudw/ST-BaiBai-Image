@@ -5,9 +5,10 @@ import { serializeImageTag, stripImageTags } from '@/st/imageTagRegex';
 /** One mandatory image at each selected paragraph, independent of the global count range. */
 export function buildSelectedTaskNote(target: PreparedTargetText): string {
   return `【用户手动选段生成】
-目标正文中的 ${target.segments.length} 个段落全部由用户明确选中，每段必须且只能生成一张图片。
+${target.segments.length === 1 ? '本次是单段独立请求，目标正文仅有当前这一段，只生成它的一张图片；没有其它待分配的段落。\n' : ''}目标正文中的 ${target.segments.length} 个段落全部由用户明确选中，每段必须且只能生成一张图片。
 position 必须逐一覆盖 ${target.segments.map(segment => segment.id).join('、')}，每个编号恰好出现一次；按段落顺序输出，不得遗漏、重复、合并段落或额外生成。
 每张图片只表现它对应段落中的一个可见瞬间，不得把另一段的事件拼进同一张图。即使两段连续或相似，也分别生成；上下文、角色库、世界书和角色参考只用于理解指代与补充外貌设定，不代表这些人物必须入镜。
+参考信息中的动作、事件和人物组合不得作为当前画面的新增内容；有指代不明确时只补充理解当前段落所必需的信息，不把参考剧情改编进图片。
 本次张数固定，不采用自动选图、空结果、去重或最少/最多张数的设置。漫画模式同样每段恰好一页。
 本次不更新角色档案，changes 返回空数组。`;
 }

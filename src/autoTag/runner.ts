@@ -293,20 +293,12 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     abort(floor, 'empty-source', opts.manual, '本楼正文是空的（或只剩生图 tag），没有可分析的内容');
     return;
   }
-  const allPreparedTarget = prepareTargetText(source, settings.excludes.customStripTags);
+  const preparedTarget = prepareTargetText(source, settings.excludes.customStripTags);
   const selectedSet = selective ? new Set(opts.selectedLines) : null;
   const selectedSegments = selectedSet
-    ? allPreparedTarget.segments.filter(segment => selectedSet.has(segment.sourceLine))
-    : allPreparedTarget.segments;
-  const preparedTarget: PreparedTargetText = selectedSet
-    ? {
-        segments: selectedSegments.map((segment, index) => ({ ...segment, id: `P${index + 1}` })),
-        promptText: selectedSegments
-          .map((segment, index) => `${segment.text} ⟦P${index + 1}⟧`)
-          .join('\n\n'),
-      }
-    : allPreparedTarget;
-  if (!preparedTarget.segments.length) {
+    ? preparedTarget.segments.filter(segment => selectedSet.has(segment.sourceLine))
+    : preparedTarget.segments;
+  if (!selectedSegments.length) {
     abort(
       floor,
       'no-target-segments',
@@ -337,7 +329,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     swipeId,
     identity,
     sourceLength: source.length,
-    segmentCount: preparedTarget.segments.length,
+    segmentCount: selectedSegments.length,
   });
 
   const runKey = `${chatId}\u0000${floor}`;
@@ -345,13 +337,13 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   const controller = new AbortController();
   running.set(runKey, controller);
   let markedSequenceIndexes: number[] = [];
+  let progressToast: unknown;
+  const clearProgress = () => {
+    if (progressToast) toastr.clear(progressToast);
+    progressToast = undefined;
+  };
 
   try {
-    const memory = readBookMemory(
-      floor,
-      selective ? selectedSegments.map(segment => segment.text).join('\n') : context.chat[floor]?.mes ?? '',
-      context.name1,
-    );
     // 单槽重写:库文本要包含本楼已落档的增量(首次全量分析建的档),否则 AI 会把
     // 已建档角色当新人重写。charTagsBeforeFloor(floor + 1) 正好含本楼(swipe 匹配时生效)。
     const entriesBefore = slot || selective ? charTagsBeforeFloor(floor + 1) : charTagsBeforeFloor(floor);
@@ -362,25 +354,20 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     // 单槽重写:协议强制「恰好 1 张」,并把该槽位当前提示词与其余槽位摘要带给模型
     // (锚住同一个画面、别抢别人的画面)。min/max 要同时覆盖 build 的规则文案与下面的
     // parse 校验,只改一处会自相矛盾。
-    const promptOptions = slot
+    const promptOptions = slot || selective
       ? { ...settings.autoTag, minImages: 1, maxImages: 1 }
-      : selective
-        ? { ...settings.autoTag, minImages: selectedSegments.length, maxImages: selectedSegments.length }
-        : settings.autoTag;
+      : settings.autoTag;
     // 协议形态开跑时快照一次:写协议、验收与收尾同一份,用户中途拨开关也不会前后不一
     const profile = autoTagProfile();
-    const messages = await buildAutoTagMessages(
-      context,
-      floor,
-      promptOptions,
-      memory,
-      preparedTarget,
-      anchors.text,
-      slot ? buildSlotTaskNote(rawSource, slot.seq) : selective ? buildSelectedTaskNote(preparedTarget) : '',
-      profile,
-      selectedSet ? selectedSegments.map(segment => segment.text).join('\n') : undefined,
-    );
     const channel = getTagGenChannel();
+    // 每段使用全新的消息列表,正文只含自身,不把其它选段或已生成的 tag 带进下一次请求。
+    // P1 是每次请求内部唯一合法位置;最终由程序绑定回原段落,不让模型跨段分配。
+    const targets: PreparedTargetText[] = selective
+      ? selectedSegments.map(segment => ({
+          segments: [{ ...segment, id: 'P1' }],
+          promptText: `${segment.text} ⟦P1⟧`,
+        }))
+      : [preparedTarget];
     // 失败重试:请求异常与「返回无法解析/校验不通过」都视为可重试的异常(后者常见于模型没遵守协议);
     // 中止信号立即收手,不消耗重试。parseImagePlan 对坏输出抛错,「无画面」则是正常返回空数组。
     // 解析/校验放进 validate 回调:不过则请求历史如实记为失败(而非「HTTP 拿到文本」的绿色成功),
@@ -388,81 +375,134 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     const retries = Math.max(0, Math.floor(Number(settings.autoTag.retryCount) || 0));
     let plan: ImagePlan | null = null;
     let lastError = '';
-    for (let attempt = 0; attempt <= retries && !plan; attempt++) {
+    const failedParagraphs: number[] = [];
+    for (const [taskIndex, target] of targets.entries()) {
       if (controller.signal.aborted) {
         processed.delete(identity);
         return;
       }
+      let taskPlan: ImagePlan | null = null;
       try {
-        // parsed 用对象壳装着:validate 闭包写入,await 之后读取——请求成功 + 验收通过才非空。
-        // (直接 let 会被 TS 收窄成 null:闭包内的赋值控制流分析看不见。)
-        const parsed: { plan: ImagePlan | null } = { plan: null };
-        const validate = (raw: string) => {
-          // 选段强制逐段对应;普通漫画流程仍由 AI 决定页数。
-          const candidate = selective
-            ? parseSelectedImagePlan(raw, preparedTarget.segments, profile.comic)
-            : profile.comic
-              ? parseComicPlan(raw, preparedTarget.segments)
-              : parseImagePlan(
-                  raw,
-                  preparedTarget.segments,
-                  promptOptions.minImages,
-                  promptOptions.maxImages,
-                );
-          // 单槽重写忽略本次 changes,不校验建档 nl —— 校验它会为一份会被丢弃的
-          // changes 白白消耗重试次数。NAI 关了自然语言时协议不要 nl,也就不验。
-          if (
-            !slot &&
-            !selective &&
-            profile.naiCharPrompts &&
-            profile.nl &&
-            candidate.changes.some(change => change.field === 'new' && !change.nl?.trim())
-          ) {
-            throw new Error('NAI 4.5/V5 建档必须附带 nl 外貌描述');
+        if (selective) {
+          clearProgress();
+          progressToast = toastr.info(`正在分析第 ${taskIndex + 1} / ${targets.length} 段`, '柏宝绘 · 按段落出图', {
+            timeOut: 0, extendedTimeOut: 0, closeButton: true,
+          });
+        }
+        const memory = readBookMemory(
+          floor,
+          selective ? target.segments[0].text : context.chat[floor]?.mes ?? '',
+          context.name1,
+        );
+        const messages = await buildAutoTagMessages(
+          context,
+          floor,
+          promptOptions,
+          memory,
+          target,
+          anchors.text,
+          slot ? buildSlotTaskNote(rawSource, slot.seq) : selective ? buildSelectedTaskNote(target) : '',
+          profile,
+          selective ? target.segments[0].text : undefined,
+        );
+        for (let attempt = 0; attempt <= retries && !taskPlan; attempt++) {
+          if (controller.signal.aborted) {
+            processed.delete(identity);
+            return;
           }
-          parsed.plan = candidate;
-        };
-        // 有重试时给 source 带上第几次,历史里两条记录一眼看出是重试关系
-        const source = slot
-          ? `重写提示词(第 ${floor} 楼 · 第 ${slot.seq + 1} 张${retries > 0 ? ` · 第 ${attempt + 1} 次` : ''})`
-          : selective
-            ? `选段生成 tag(第 ${floor} 楼 · ${selectedSegments.length} 段${retries > 0 ? ` · 第 ${attempt + 1} 次` : ''})`
-            : retries > 0
-            ? `自动 tag(第 ${floor} 楼 · 第 ${attempt + 1} 次)`
-            : `自动 tag(第 ${floor} 楼)`;
-        if (channel) {
-          await requestCompletion(channel, messages, {
-            signal: controller.signal,
-            source,
-            validate,
-          });
-        } else {
-          await requestViaMainApi(messages, {
-            signal: controller.signal,
-            source,
-            validate,
-          });
+          try {
+            // parsed 用对象壳装着:validate 闭包写入,await 之后读取——请求成功 + 验收通过才非空。
+            // (直接 let 会被 TS 收窄成 null:闭包内的赋值控制流分析看不见。)
+            const parsed: { plan: ImagePlan | null } = { plan: null };
+            const validate = (raw: string) => {
+              // 选段强制逐段对应;普通漫画流程仍由 AI 决定页数。
+              const candidate = selective
+                ? parseSelectedImagePlan(raw, target.segments, profile.comic)
+                : profile.comic
+                  ? parseComicPlan(raw, target.segments)
+                  : parseImagePlan(
+                      raw,
+                      target.segments,
+                      promptOptions.minImages,
+                      promptOptions.maxImages,
+                    );
+              // 单槽重写忽略本次 changes,不校验建档 nl —— 校验它会为一份会被丢弃的
+              // changes 白白消耗重试次数。NAI 关了自然语言时协议不要 nl,也就不验。
+              if (
+                !slot &&
+                !selective &&
+                profile.naiCharPrompts &&
+                profile.nl &&
+                candidate.changes.some(change => change.field === 'new' && !change.nl?.trim())
+              ) {
+                throw new Error('NAI 4.5/V5 建档必须附带 nl 外貌描述');
+              }
+              parsed.plan = candidate;
+            };
+            // 有重试时给 source 带上第几次,历史里两条记录一眼看出是重试关系
+            const source = slot
+              ? `重写提示词(第 ${floor} 楼 · 第 ${slot.seq + 1} 张${retries > 0 ? ` · 第 ${attempt + 1} 次` : ''})`
+              : selective
+                ? `选段生成 tag(第 ${floor} 楼 · 第 ${taskIndex + 1}/${targets.length} 段${retries > 0 ? ` · 第 ${attempt + 1} 次` : ''})`
+                : retries > 0
+                ? `自动 tag(第 ${floor} 楼 · 第 ${attempt + 1} 次)`
+                : `自动 tag(第 ${floor} 楼)`;
+            if (channel) {
+              await requestCompletion(channel, messages, {
+                signal: controller.signal,
+                source,
+                validate,
+              });
+            } else {
+              await requestViaMainApi(messages, {
+                signal: controller.signal,
+                source,
+                validate,
+              });
+            }
+            if (controller.signal.aborted) {
+              processed.delete(identity);
+              return;
+            }
+            taskPlan = parsed.plan;
+          } catch (error) {
+            if (controller.signal.aborted) {
+              processed.delete(identity);
+              return;
+            }
+            lastError = error instanceof Error ? error.message : String(error);
+            console.warn(`[柏宝绘] 第 ${floor} 楼第 ${attempt + 1}/${retries + 1} 次生成 tag 失败`, error);
+          }
         }
-        if (controller.signal.aborted) {
-          processed.delete(identity);
-          return;
-        }
-        plan = parsed.plan;
       } catch (error) {
         if (controller.signal.aborted) {
           processed.delete(identity);
           return;
         }
         lastError = error instanceof Error ? error.message : String(error);
-        console.warn(`[柏宝绘] 第 ${floor} 楼第 ${attempt + 1}/${retries + 1} 次生成 tag 失败`, error);
+        console.warn(`[柏宝绘] 第 ${floor} 楼构建 tag 请求失败`, error);
+      }
+      if (taskPlan) {
+        if (selective) {
+          const segment = selectedSegments[taskIndex];
+          const image = { ...taskPlan.images[0], position: segment.id, sourceLine: segment.sourceLine };
+          plan ??= { images: [], changes: [] };
+          plan.images.push(image);
+        } else {
+          plan = taskPlan;
+        }
+      } else if (selective) {
+        failedParagraphs.push(taskIndex + 1);
+        console.warn(`[柏宝绘] 选段 ${taskIndex + 1}/${targets.length} 生成失败,保留原 tag: ${lastError}`);
       }
     }
+    clearProgress();
     if (!plan) {
       // 重试耗尽:允许同一正文在后续重新渲染后再试
       processed.delete(identity);
       toastr.error(
-        `${lastError}${retries > 0 ? `(已自动重试 ${retries} 次)` : ''}`,
-        '柏宝绘自动 tag 失败',
+        `${selective ? `所选 ${targets.length} 段均生成失败，原 tag 已保留。` : ''}${lastError}${retries > 0 ? `(已自动重试 ${retries} 次)` : ''}`,
+        selective ? '柏宝绘选段生成失败' : '柏宝绘自动 tag 失败',
       );
       return;
     }
@@ -599,17 +639,17 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
         if (!opts.replace && !selective && hasImageTagTrace(currentText)) return null;
         const rebased = rebaseImagePositions(
           base,
-          selective ? allPreparedTarget.segments : preparedTarget.segments,
+          preparedTarget.segments,
           plan.images,
           settings.excludes.customStripTags,
         );
         if (!rebased) return null;
         rebaseNote = describeRebase(rebased.report);
         if (selective) {
-          // Every paragraph now has exactly one image, so cleanup follows those same anchors.
+          // Only successful paragraphs get new images; failed paragraphs keep their old tags.
           // If a paragraph disappeared or multiple paragraphs merged, preserve the old tags.
           const currentSelectedLines = new Set(rebased.images.map(image => image.sourceLine));
-          if (rebased.report.drifted || currentSelectedLines.size !== selectedSegments.length) return null;
+          if (rebased.report.drifted || currentSelectedLines.size !== plan.images.length) return null;
           // Mark only the final indexes, after rebasing and accounting for retained tags.
           // Explicit paragraph generation must draw even if automatic drawing is disabled.
           markedSequenceIndexes = selectedImageSequences(currentText, currentSelectedLines, rebased.images);
@@ -638,6 +678,13 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       }
       recomputeCharTags();
       if (rebaseNote) console.info(`[柏宝绘] 第 ${floor} 楼 tag 位置重定位:${rebaseNote}`);
+      if (failedParagraphs.length) {
+        toastr.warning(
+          `已为 ${plan.images.length} 段更新 tag，正在出图；所选第 ${failedParagraphs.join('、')} 段生成失败，原 tag 已保留`,
+          '柏宝绘 · 部分段落生成成功',
+        );
+        return;
+      }
       if (plan.images.length) {
         toastr.success(
           profile.comic
@@ -680,6 +727,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     console.error(`[柏宝绘] 第 ${floor} 楼自动生成 tag 失败`, error);
     toastr.error(message, '柏宝绘自动 tag 失败');
   } finally {
+    clearProgress();
     if (running.get(runKey) === controller) running.delete(runKey);
   }
 }

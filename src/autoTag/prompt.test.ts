@@ -92,6 +92,26 @@ function context(): STContext {
 }
 
 describe('auto tag prompt', () => {
+  it('builds isolated single-paragraph targets without including sibling paragraphs or generated tags', async () => {
+    const ctx = context();
+    ctx.chat[1].mes = '甲在卧室读书。\n<bbi_image>旧卧室 tag</bbi_image>\n乙在花园浇花。';
+    const options = { ...settings.autoTag, minImages: 1, maxImages: 1 };
+    for (const [text, other] of [['甲在卧室读书。', '乙在花园浇花。'], ['乙在花园浇花。', '甲在卧室读书。']]) {
+      const target = prepareTargetText(text, []);
+      const messages = await buildAutoTagMessages(
+        ctx, 1, options, null, target, '【角色固定外貌库】甲：黑发；乙：白发',
+        buildSelectedTaskNote(target), autoTagProfile(), text,
+      );
+      const content = messages.at(-1)!.content;
+      expect(content).toContain(`${text} ⟦P1⟧`);
+      expect(content).not.toContain(other);
+      expect(content).not.toContain('旧卧室 tag');
+      expect(content).toContain('单段独立请求');
+      expect(content).toContain('参考信息中的动作、事件和人物组合不得作为当前画面的新增内容');
+      expect(content).toContain('甲：黑发；乙：白发');
+    }
+  });
+
   it.each([false, true])('selected paragraphs require exactly one image each (comic=%s), ignoring global counts', async comic => {
     const target = prepareTargetText('选中的第一段\n选中的第二段', []);
     const options = { ...settings.autoTag, minImages: 0, maxImages: 1 };

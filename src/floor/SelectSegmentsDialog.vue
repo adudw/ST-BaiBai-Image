@@ -42,7 +42,7 @@ requestAnimationFrame(() => { open.value = true; });
         <button class="bbi-icon-mini" type="button" aria-label="关闭" @click="emit('cancel')">×</button>
       </header>
       <p class="bbi-select-segments__hint">
-        每个勾选段落固定生成一张图片，不使用设置里的最少／最多张数。未选段落及其 tag 保留；成功后替换所选段落的旧 tag。
+        每段单独分析，固定生成一张图片，不使用设置里的最少／最多张数。成功段落替换旧 tag 并出图；失败段落保留旧 tag，未选段落保持原样。
       </p>
       <div class="bbi-select-segments__tools">
         <button class="bbi-btn" type="button" @click="setAll(true)">全选</button>
